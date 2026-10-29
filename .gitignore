@@ -23,9 +23,10 @@ rustc-ice-*.txt
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Local cluster credentials used by the live tests (VALKEN_TEST_KUBECONFIG)
-kubeconfig
-kubeconfig.*
-*.kubeconfig
-.env
-.env.*
+# Local cluster credentials used by the live tests (VALKEN_TEST_KUBECONFIG).
+# Anchored to the repo root: src/k8s/kubeconfig/ is source.
+/kubeconfig
+/kubeconfig.*
+/*.kubeconfig
+/.env
+/.env.*
