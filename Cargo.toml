@@ -1,0 +1,51 @@
+[package]
+name = "valken-core"
+version = "0.1.0"
+edition = "2021"
+# kube 3.x and godot 0.4 both require >= 1.88; CI checks this toolchain builds.
+rust-version = "1.88"
+description = "Core Kubernetes connectivity library for Valken"
+license = "Apache-2.0"
+repository = "https://github.com/valkenhq/valken-core"
+readme = "README.md"
+keywords = ["kubernetes", "kube", "godot", "observability"]
+categories = ["api-bindings", "visualization"]
+# Consumed as a git dependency by the Valken app; not on crates.io.
+publish = false
+
+[lib]
+crate-type = ["lib"]
+
+[features]
+default = ["godot"]
+# The three Godot nodes (AsyncRuntime, AsyncNotifier, KubeStore).  Everything
+# else in the crate is plain Rust and builds + tests with
+# `cargo test --no-default-features`.
+godot = ["dep:godot"]
+
+[dependencies]
+anyhow = "1.0.100"
+base64 = "0.22"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+crossbeam-channel = "0.5.15"
+futures = "0.3.31"
+http = "1"
+godot = { version = "0.4.5", features = ["experimental-godot-api", "api-4-4"], optional = true }
+k8s-metrics = "0.27.0"
+k8s-openapi = { version = "0.27.0", features = ["v1_34"] }
+kube = { version = "3.0", features = ["runtime", "derive"] }
+petgraph = "0.8.3"
+serde = "1"
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "time", "macros", "sync", "process"] }
+tokio-util = "0.7"
+tracing = "0.1.41"
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+
+[dev-dependencies]
+tempfile = "3"
+tracing-core = "0.1"
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "time", "macros", "sync", "test-util", "io-util", "net"] }
