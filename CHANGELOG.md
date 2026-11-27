@@ -3,7 +3,7 @@
 Notable changes, newest first. Versions are git tags; see *Contributing
 and releases* in the README.
 
-## Unreleased (0.2.0)
+## Unreleased (0.3.0)
 
 - **Cluster health** (`k8s::cluster_health`): every `KubeWatcher` session
   keeps a `ClusterHealth` snapshot — nodes with conditions, pool / zone /
