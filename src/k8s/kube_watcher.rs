@@ -24,23 +24,29 @@ use futures::stream::{self, StreamExt};
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Namespace, Pod, Service};
 use k8s_openapi::api::networking::v1::Ingress;
+use kube::client::ClientBuilder;
 use kube::config::Kubeconfig;
 use kube::runtime::reflector::{self, ObjectRef, Store};
 use kube::runtime::watcher::{self, Event};
 use kube::{Client, Config};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{oneshot, watch, Notify};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn, Instrument};
 
-use crate::async_runtime::{global_notifier, Notifier};
+use crate::async_runtime::Notifier;
+use crate::k8s::cluster_health::{
+    run_cluster_health, top_pods_on_node, ApiStats, ApiStatsLayer, ClusterHealth,
+    ClusterHealthSettings, HealthPublisher, MonitorInputs, NodePods,
+};
 use crate::k8s::error::describe_watch;
 use crate::k8s::health::{
     run_health_monitor, watch_error_cause, Health, HealthReporter, HealthSettings,
 };
 use crate::k8s::kubeconfig::probe::{classify as classify_probe_error, ProbeError};
 use crate::k8s::kubeconfig::{AuthKind, ExecEnv};
-use crate::k8s::metrics::{spawn_cluster_metrics_monitor, ClusterMetricsSettings};
+#[allow(deprecated)]
+use crate::k8s::metrics::ClusterMetricsSettings;
 use crate::k8s::{
     ClusterSource, ConnectError, KubeClusterSource, KubeResource, NamespaceInfo, WatchError,
     Watched, WatchedResources,
@@ -105,8 +111,10 @@ struct Session {
     /// The watch itself.  When it has ended — [`KubeWatcher::stop`], or the
     /// primary receiver was dropped — the session is over.
     watch: JoinHandle<()>,
-    /// Health pinger and metrics monitor; they die with the token.
+    /// Health pinger and cluster health monitor; they die with the token.
     tasks: Vec<JoinHandle<()>>,
+    /// The pod reflector's store, for on-demand queries (top pods).
+    pods: Store<Pod>,
 }
 
 #[derive(Clone)]
@@ -131,8 +139,10 @@ pub struct KubeWatcher {
     cluster_id: Arc<AtomicU32>,
     session: Arc<Mutex<Option<Session>>>,
     is_running: Arc<AtomicBool>,
-    notifier: Arc<dyn Notifier>,
-    metrics_settings: ClusterMetricsSettings,
+    /// Latency and errors of every request this watcher's client makes.
+    api_stats: Arc<ApiStats>,
+    cluster_health: HealthPublisher,
+    cluster_health_settings: ClusterHealthSettings,
 }
 
 impl KubeWatcher {
@@ -155,20 +165,32 @@ impl KubeWatcher {
             cluster_id: Arc::new(AtomicU32::new(0)),
             session: Arc::new(Mutex::new(None)),
             is_running: Arc::new(AtomicBool::new(false)),
-            notifier: global_notifier(),
-            metrics_settings: ClusterMetricsSettings::default(),
+            api_stats: Arc::new(ApiStats::new()),
+            cluster_health: HealthPublisher::new(),
+            cluster_health_settings: ClusterHealthSettings::default(),
         }
     }
 
-    /// Route metrics messages somewhere other than the global channel.
-    pub fn with_notifier(mut self, notifier: Arc<dyn Notifier>) -> Self {
-        self.notifier = notifier;
+    /// No longer has an effect: the watcher no longer sends
+    /// `AsyncMessage::ClusterMetrics`.
+    #[deprecated(
+        since = "0.2.0",
+        note = "cluster metrics are part of the cluster health snapshot; use subscribe_cluster_health"
+    )]
+    pub fn with_notifier(self, _notifier: Arc<dyn Notifier>) -> Self {
         self
     }
 
-    /// Override the metrics monitor timing (tests).
-    pub fn with_metrics_settings(mut self, settings: ClusterMetricsSettings) -> Self {
-        self.metrics_settings = settings;
+    /// No longer has an effect; see [`Self::with_cluster_health_settings`].
+    #[deprecated(since = "0.2.0", note = "use with_cluster_health_settings")]
+    #[allow(deprecated)]
+    pub fn with_metrics_settings(self, _settings: ClusterMetricsSettings) -> Self {
+        self
+    }
+
+    /// Override the cluster health monitor's timing and thresholds.
+    pub fn with_cluster_health_settings(mut self, settings: ClusterHealthSettings) -> Self {
+        self.cluster_health_settings = settings;
         self
     }
 
@@ -202,6 +224,70 @@ impl KubeWatcher {
     /// A receiver that sees every health change, for async consumers.
     pub fn subscribe_health(&self) -> watch::Receiver<Health> {
         self.health.subscribe()
+    }
+
+    /// The latest [`ClusterHealth`] snapshot: nodes, capacity, issues,
+    /// sparklines.  Empty (`updated: None`) before the session's first
+    /// snapshot and after [`Self::stop`].
+    pub fn cluster_health(&self) -> Arc<ClusterHealth> {
+        self.cluster_health.current()
+    }
+
+    /// A receiver that sees every new [`ClusterHealth`] snapshot.
+    pub fn subscribe_cluster_health(&self) -> watch::Receiver<Arc<ClusterHealth>> {
+        self.cluster_health.subscribe()
+    }
+
+    /// Latency and error counters of this watcher's API client.
+    pub fn api_stats(&self) -> Arc<ApiStats> {
+        self.api_stats.clone()
+    }
+
+    /// The pods on `node`, heaviest by memory first (at most `limit`), with
+    /// live usage when the metrics-server has it.  Reads the pod store and
+    /// lists pod metrics only in the namespaces those pods are in.  Empty
+    /// while not watching.
+    pub async fn top_pods_on_node(&self, node: &str, limit: usize) -> NodePods {
+        let pods = self
+            .session
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|s| s.pods.clone());
+        let Some(pods) = pods else {
+            return NodePods::default();
+        };
+        let metrics = self
+            .source
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+            .and_then(|s| s.metrics());
+        top_pods_on_node(&pods, metrics, node, limit).await
+    }
+
+    /// The pods bound to `node` that still hold resources there (not
+    /// Succeeded / Failed), from the watch's own store: no request.  Empty
+    /// while not watching.  The `Arc`s are shared with the store.
+    pub fn pods_on_node(&self, node: &str) -> Vec<Arc<Pod>> {
+        let pods = self
+            .session
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|s| s.pods.clone());
+        pods.map(|store| crate::k8s::cluster_health::pods_bound_to(&store, node))
+            .unwrap_or_default()
+    }
+
+    /// A client for `config` whose requests are recorded in
+    /// [`Self::api_stats`].  A new connection starts the counters afresh.
+    fn build_client(&self, config: Config) -> Result<Client, ConnectError> {
+        self.api_stats.reset();
+        Ok(ClientBuilder::try_from(config)
+            .map_err(ConnectError::Client)?
+            .with_layer(&ApiStatsLayer::new(self.api_stats.clone()))
+            .build())
     }
 
     /// Register a secondary channel that will receive a clone of every
@@ -294,7 +380,7 @@ impl KubeWatcher {
         info!("Inferring Kubernetes configuration...");
         let config = Config::infer().await?;
         info!(cluster_url = %config.cluster_url, "Configuration inferred");
-        let client = Client::try_from(config.clone()).map_err(ConnectError::Client)?;
+        let client = self.build_client(config.clone())?;
 
         // The kubeconfig's current context is the best display name.
         let name = Kubeconfig::read()
@@ -344,7 +430,7 @@ impl KubeWatcher {
         }
         let namespace = config.default_namespace.clone();
         let (config, timeout) = for_watching(config);
-        let client = Client::try_from(config).map_err(ConnectError::Client)?;
+        let client = self.build_client(config)?;
 
         progress(ConnectStep::ReachApi);
         let version = tokio::time::timeout(timeout, detached(client.apiserver_version()))
@@ -447,11 +533,21 @@ impl KubeWatcher {
                 return Err(WatchError::AlreadyWatching);
             }
 
+            // The pod reflector's store is shared with the health monitor
+            // and on-demand queries: one copy of every pod.
+            let (pod_store, pod_writer) = reflector::store::<Pod>();
+            let pods_changed = Arc::new(Notify::new());
             let watch_task = tokio::spawn(
                 run_watch(
                     source.clone(),
-                    self.sender_channel.clone(),
-                    self.fanout_snapshot(),
+                    Outlet {
+                        tx: self.sender_channel.clone(),
+                        fan: self.fanout_snapshot(),
+                    },
+                    PodFeed {
+                        writer: pod_writer,
+                        changed: pods_changed.clone(),
+                    },
                     self.cluster_id.clone(),
                     self.health.clone(),
                     cancel.clone(),
@@ -470,24 +566,27 @@ impl KubeWatcher {
                 .instrument(tracing::info_span!(parent: None, "kube_health", cluster_id)),
             );
 
-            let mut tasks = vec![health_task];
-            if let Some(metrics) = source.metrics() {
-                info!("Starting cluster metrics monitoring...");
-                let monitor = spawn_cluster_metrics_monitor(
-                    &tokio::runtime::Handle::current(),
-                    metrics,
-                    self.notifier.clone(),
-                    cluster_id,
+            let cluster_health_task = tokio::spawn(
+                run_cluster_health(
+                    MonitorInputs {
+                        source: source.clone(),
+                        pods: pod_store.clone(),
+                        pods_changed,
+                        api: self.api_stats.clone(),
+                        publisher: self.cluster_health.clone(),
+                        settings: self.cluster_health_settings,
+                    },
                     cancel.child_token(),
-                    self.metrics_settings,
-                );
-                tasks.push(monitor.into_join());
-            }
+                )
+                .instrument(tracing::info_span!(parent: None, "cluster_health", cluster_id)),
+            );
+            let tasks = vec![health_task, cluster_health_task];
 
             *session = Some(Session {
                 cancel,
                 watch: watch_task,
                 tasks,
+                pods: pod_store,
             });
         }
         self.is_running.store(true, Ordering::SeqCst);
@@ -550,6 +649,7 @@ impl KubeWatcher {
         }
         self.set_client(None);
         self.health.reset();
+        self.cluster_health.reset();
         if let Ok(mut guard) = self.source.write() {
             *guard = None;
         }
@@ -690,16 +790,22 @@ impl Outlet {
     }
 }
 
+/// The pod reflector's writer, and the signal the health monitor waits on.
+struct PodFeed {
+    writer: reflector::store::Writer<Pod>,
+    changed: Arc<Notify>,
+}
+
 async fn run_watch(
     source: Arc<dyn ClusterSource>,
-    tx: crossbeam_channel::Sender<Watched>,
-    fan: Vec<crossbeam_channel::Sender<Watched>>,
+    outlet: Outlet,
+    pods: PodFeed,
     cluster_id: Arc<AtomicU32>,
     health: HealthReporter,
     cancel: CancellationToken,
     ready: oneshot::Sender<Result<(), WatchError>>,
 ) {
-    let (pod_store, pod_writer) = reflector::store::<Pod>();
+    let pod_store = pods.writer.as_reader();
     let (dep_store, dep_writer) = reflector::store::<Deployment>();
     let (svc_store, svc_writer) = reflector::store::<Service>();
     let (ing_store, ing_writer) = reflector::store::<Ingress>();
@@ -713,7 +819,7 @@ async fn run_watch(
     };
 
     let mut merged = stream::select_all(vec![
-        reflector::reflector(pod_writer, source.watch_pods())
+        reflector::reflector(pods.writer, source.watch_pods())
             .map(Ev::Pod)
             .boxed(),
         reflector::reflector(dep_writer, source.watch_deployments())
@@ -730,7 +836,6 @@ async fn run_watch(
             .boxed(),
     ]);
 
-    let outlet = Outlet { tx, fan };
     let mut sync = SyncState::default();
     let mut initial_sent = false;
     let mut ready = Some(ready);
@@ -781,7 +886,11 @@ async fn run_watch(
         }
 
         match ev {
-            Ev::Pod(r) => handle!(r, pods, Watched::Pod, Watched::DeletedPod),
+            Ev::Pod(r) => {
+                // Coalesces: one stored permit however many events arrive.
+                pods.changed.notify_one();
+                handle!(r, pods, Watched::Pod, Watched::DeletedPod)
+            }
             Ev::Deployment(r) => {
                 handle!(
                     r,
@@ -1002,6 +1111,23 @@ mod tests {
             "the span must close although the client (and its pooled connection) is alive"
         );
         drop(client);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_watchers_client_records_api_latency() {
+        let url = version_server().await;
+        let (tx, _rx) = unbounded();
+        let w = KubeWatcher::new(tx);
+        let client = w.build_client(Config::new(url.parse().unwrap())).unwrap();
+        client.apiserver_version().await.expect("version");
+        client.apiserver_version().await.expect("version");
+        let s = w.api_stats().summary();
+        assert_eq!((s.requests, s.errors), (2, 0));
+        assert!(s.p95.is_some());
+
+        // A new connection starts the counters afresh.
+        let _again = w.build_client(Config::new(url.parse().unwrap())).unwrap();
+        assert_eq!(w.api_stats().summary().requests, 0);
     }
 
     #[test]

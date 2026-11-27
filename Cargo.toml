@@ -1,6 +1,6 @@
 [package]
 name = "valken-core"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 # kube 3.x and godot 0.4 both require >= 1.88; CI checks this toolchain builds.
 rust-version = "1.88"
@@ -42,6 +42,8 @@ sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "time", "macros", "sync", "process"] }
 tokio-util = "0.7"
+tower-layer = "0.3"
+tower-service = "0.3"
 tracing = "0.1.41"
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 

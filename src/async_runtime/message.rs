@@ -29,7 +29,12 @@ pub enum AsyncMessage {
     },
     /// A cluster connection failed; `error` is already safe to display.
     ConnectionFailure { error: String },
-    /// Cluster resource metrics update.
+    /// Cluster resource metrics update.  No longer sent by
+    /// [`crate::k8s::KubeWatcher`].
+    #[deprecated(
+        since = "0.2.0",
+        note = "use KubeWatcher::subscribe_cluster_health (k8s::cluster_health)"
+    )]
     ClusterMetrics {
         /// Local integer ID from the `clusters` DB table.
         cluster_id: u32,
