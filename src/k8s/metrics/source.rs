@@ -8,6 +8,7 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::{Api, Client};
 use tracing::debug;
 
+use crate::k8s::cluster_health::Resources;
 use crate::k8s::MetricsError;
 
 /// Cluster-wide node capacity, summed over every node.
@@ -31,6 +32,14 @@ pub struct PodUsage {
     pub memory_mib: f32,
 }
 
+/// One object's live usage from the metrics-server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageSample {
+    /// Node name, or pod name for [`MetricsSource::pod_usages`].
+    pub name: String,
+    pub usage: Resources,
+}
+
 /// Everything the metrics monitors read from a cluster.
 #[async_trait]
 pub trait MetricsSource: Send + Sync + 'static {
@@ -39,6 +48,19 @@ pub trait MetricsSource: Send + Sync + 'static {
     async fn pod_usage(&self, namespace: &str, pod: &str) -> Result<PodUsage, MetricsError>;
     /// Sum of `restartCount` over the pod's containers.
     async fn pod_restarts(&self, namespace: &str, pod: &str) -> Result<i32, MetricsError>;
+
+    /// Usage of every node, in one request.  Sources without per-node
+    /// metrics answer [`MetricsError::Unsupported`].
+    async fn node_usages(&self) -> Result<Vec<UsageSample>, MetricsError> {
+        Err(MetricsError::Unsupported)
+    }
+
+    /// Usage of every pod in `namespace` (summed over its containers), in
+    /// one request.
+    async fn pod_usages(&self, namespace: &str) -> Result<Vec<UsageSample>, MetricsError> {
+        let _ = namespace;
+        Err(MetricsError::Unsupported)
+    }
 }
 
 /// [`MetricsSource`] backed by the core API and the metrics-server.
@@ -131,6 +153,52 @@ impl MetricsSource for KubeMetricsSource {
             cpu_millicores: (cores * 1000.0) as f32,
             memory_mib: bytes as f32 / (1024.0 * 1024.0),
         })
+    }
+
+    async fn node_usages(&self) -> Result<Vec<UsageSample>, MetricsError> {
+        let metrics: Api<NodeMetrics> = Api::all(self.client.clone());
+        let list = metrics.list(&Default::default()).await?;
+        Ok(list
+            .items
+            .iter()
+            .filter_map(|m| {
+                let name = m.metadata.name.clone()?;
+                let cpu = cpu_millicores(&m.usage.cpu, "nodemetrics.usage.cpu");
+                let mem = memory_bytes(&m.usage.memory, "nodemetrics.usage.memory");
+                match (cpu, mem) {
+                    (Ok(c), Ok(b)) => Some(UsageSample {
+                        name,
+                        usage: Resources::new(c, b),
+                    }),
+                    (Err(e), _) | (_, Err(e)) => {
+                        debug!(node = %name, error = %e, "skipping node usage");
+                        None
+                    }
+                }
+            })
+            .collect())
+    }
+
+    async fn pod_usages(&self, namespace: &str) -> Result<Vec<UsageSample>, MetricsError> {
+        let api: Api<PodMetrics> = Api::namespaced(self.client.clone(), namespace);
+        let list = api.list(&Default::default()).await?;
+        Ok(list
+            .items
+            .iter()
+            .filter_map(|pm| {
+                let name = pm.metadata.name.clone()?;
+                let mut usage = Resources::ZERO;
+                for c in &pm.containers {
+                    if let Ok(cores) = c.cpu() {
+                        usage.cpu_millicores += (cores * 1000.0).round() as i64;
+                    }
+                    if let Ok(bytes) = c.memory() {
+                        usage.memory_bytes += bytes;
+                    }
+                }
+                Some(UsageSample { name, usage })
+            })
+            .collect())
     }
 
     async fn pod_restarts(&self, namespace: &str, pod: &str) -> Result<i32, MetricsError> {

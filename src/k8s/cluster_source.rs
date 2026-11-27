@@ -11,7 +11,7 @@ use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{Namespace, Pod, Service};
+use k8s_openapi::api::core::v1::{Namespace, Node, Pod, Service};
 use k8s_openapi::api::networking::v1::Ingress;
 use kube::api::ListParams;
 use kube::runtime::watcher::{self, watcher, Event};
@@ -33,6 +33,14 @@ pub trait ClusterSource: Send + Sync + 'static {
     fn watch_services(&self) -> WatchStream<Service>;
     fn watch_ingresses(&self) -> WatchStream<Ingress>;
     fn watch_namespaces(&self) -> WatchStream<Namespace>;
+
+    /// Nodes, for the cluster health monitor.  `None` when the source has
+    /// no nodes to offer (the health view is then pod-derived).  A real
+    /// cluster that forbids listing nodes still returns a stream; its 403
+    /// is handled by the monitor.
+    fn watch_nodes(&self) -> Option<WatchStream<Node>> {
+        None
+    }
 
     /// A stable, unique identifier for the cluster (the `kube-system`
     /// namespace UID on a real cluster).  `None` if it cannot be read.
@@ -107,6 +115,20 @@ impl ClusterSource for KubeClusterSource {
 
     fn watch_namespaces(&self) -> WatchStream<Namespace> {
         self.watch()
+    }
+
+    fn watch_nodes(&self) -> Option<WatchStream<Node>> {
+        // Not the generic `watch`: a Node's `status.images` is most of its
+        // size and is dropped too.
+        Some(
+            watcher(
+                Api::<Node>::all(self.client.clone()),
+                watcher::Config::default(),
+            )
+            .default_backoff()
+            .modify(crate::k8s::cluster_health::strip_node)
+            .boxed(),
+        )
     }
 
     fn cluster_uuid(&self) -> BoxFuture<'static, Option<String>> {

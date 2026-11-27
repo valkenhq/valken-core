@@ -30,6 +30,7 @@ the `godot` feature connect it to the app.
 | `k8s::ResourceIngest` | Folds those events into a store and a relationship graph. |
 | `k8s::table`, `k8s::objects`, `k8s::events`, `k8s::rollout`, `k8s::configs` | Live `kubectl get` tables, one-off reads, events, rollout history, ConfigMap / Secret *metadata*. |
 | `k8s::security` | Read-only inventory for the security lens, with redacted exports. |
+| `k8s::cluster_health` | Node and cluster health snapshot, capacity, issues, API latency. |
 | `k8s::metrics`, `traffic` | Cluster / pod metrics; ingress access-log tailing. |
 | `k8s::write` | The only code that changes a cluster. |
 

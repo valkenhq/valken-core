@@ -5,6 +5,11 @@
 //! hot path and is fetched every [`ClusterMetricsSettings::poll_interval`].
 //! The UI is notified only when a value moved by more than the trend
 //! threshold, which is also exactly when a trend arrow could have flipped.
+//!
+//! Deprecated since 0.2.0: [`crate::k8s::KubeWatcher`] no longer runs this
+//! monitor.  Per-node usage, requests and history are part of the cluster
+//! health snapshot ([`crate::k8s::cluster_health`]).
+#![allow(deprecated)]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +27,10 @@ pub(crate) const METRICS_TREND_THRESHOLD_PERCENT: f32 = 8.0;
 
 /// Timing knobs for the monitor.  Tests shrink them and run under
 /// `tokio::time::pause()`.
+#[deprecated(
+    since = "0.2.0",
+    note = "use KubeWatcher::subscribe_cluster_health (k8s::cluster_health)"
+)]
 #[derive(Debug, Clone, Copy)]
 pub struct ClusterMetricsSettings {
     /// Delay before the first API request, so the rest of the app can finish
@@ -78,6 +87,10 @@ pub(crate) fn calculate_trend(current: f32, previous: Option<f32>) -> MetricTren
 }
 
 /// The previous reading, used for trend arrows and change suppression.
+#[deprecated(
+    since = "0.2.0",
+    note = "use KubeWatcher::subscribe_cluster_health (k8s::cluster_health)"
+)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MetricsTrendState {
     cluster_id: u32,
@@ -129,6 +142,10 @@ fn percent(used: i64, capacity: i64) -> f32 {
 
 /// Handle to a running cluster metrics monitor.  Dropping it does not stop
 /// the task; cancel the token passed at spawn time.
+#[deprecated(
+    since = "0.2.0",
+    note = "use KubeWatcher::subscribe_cluster_health (k8s::cluster_health)"
+)]
 pub struct ClusterMetricsMonitor {
     join: JoinHandle<()>,
 }
@@ -149,6 +166,10 @@ impl ClusterMetricsMonitor {
 }
 
 /// Spawn [`run_cluster_metrics_monitor`] on `handle`.
+#[deprecated(
+    since = "0.2.0",
+    note = "use KubeWatcher::subscribe_cluster_health (k8s::cluster_health)"
+)]
 pub fn spawn_cluster_metrics_monitor(
     handle: &Handle,
     source: Arc<dyn MetricsSource>,
@@ -166,6 +187,10 @@ pub fn spawn_cluster_metrics_monitor(
 /// Poll `source` until `cancel` fires, sending
 /// [`AsyncMessage::ClusterMetrics`] (tagged with `cluster_id`) to `notifier`
 /// on meaningful change.
+#[deprecated(
+    since = "0.2.0",
+    note = "use KubeWatcher::subscribe_cluster_health (k8s::cluster_health)"
+)]
 pub async fn run_cluster_metrics_monitor(
     source: Arc<dyn MetricsSource>,
     notifier: Arc<dyn Notifier>,

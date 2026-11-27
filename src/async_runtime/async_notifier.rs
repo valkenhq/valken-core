@@ -148,6 +148,8 @@ impl AsyncNotifier {
                     restart_count,
                 );
             }
+            // Still forwarded for hosts that send it themselves.
+            #[allow(deprecated)]
             AsyncMessage::ClusterMetrics {
                 cluster_id,
                 cpu_percent,

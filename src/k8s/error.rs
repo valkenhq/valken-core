@@ -93,6 +93,11 @@ pub enum MetricsError {
     Api(#[from] kube::Error),
     #[error("could not parse quantity {raw:?} for {field}")]
     Quantity { field: &'static str, raw: String },
+    /// The [`crate::k8s::MetricsSource`] doesn't offer this reading.
+    #[error("not supported by this metrics source")]
+    Unsupported,
+    #[error("no answer within {0:?}")]
+    Timeout(std::time::Duration),
 }
 
 /// Failure to read one object ([`crate::k8s::objects::get_object`]).
